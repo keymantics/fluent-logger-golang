@@ -74,8 +74,9 @@ func createLogger() *log.Logger {
 type Fluent struct {
 	Config
 
-	debug *log.Logger
-	stats Stats
+	debug      *log.Logger
+	statsMutex sync.Mutex
+	stats      Stats
 
 	pending chan []byte
 	wg      sync.WaitGroup
@@ -230,7 +231,9 @@ func (f *Fluent) PostRawData(data []byte) {
 }
 
 func (f *Fluent) postRawData(data []byte) error {
+	f.statsMutex.Lock()
 	f.stats.Post++
+	f.statsMutex.Unlock()
 	if f.Config.Async {
 		return f.appendBuffer(data)
 	}
@@ -283,7 +286,9 @@ func (f *Fluent) appendBuffer(data []byte) error {
 	select {
 	case f.pending <- data:
 	default:
+		f.statsMutex.Lock()
 		f.stats.QueueIsFull++
+		f.statsMutex.Unlock()
 		f.debug.Printf("fluent#appendBuffer: Buffer full, limit %v \n", f.Config.BufferLimit)
 		return fmt.Errorf("fluent#appendBuffer: Buffer full, limit %v", f.Config.BufferLimit)
 	}
@@ -374,15 +379,21 @@ func (f *Fluent) write(data []byte) error {
 		} else {
 			f.conn.SetWriteDeadline(time.Time{})
 		}
+		f.statsMutex.Lock()
 		f.stats.Write++
+		f.statsMutex.Unlock()
 		_, err := f.conn.Write(data)
 		if err != nil {
+			f.statsMutex.Lock()
 			f.stats.WriteHTTPFail++
+			f.statsMutex.Unlock()
 			f.debug.Printf("Error will writting to fluentd: %s", err)
 			f.debug.Printf("Closing Fluentd connection due to previous error")
 			f.close()
 		} else {
+			f.statsMutex.Lock()
 			f.stats.WriteHTTPSuccess++
+			f.statsMutex.Unlock()
 			return err
 		}
 	}
@@ -393,12 +404,12 @@ func (f *Fluent) write(data []byte) error {
 
 // Stats return statistics about Fluent
 func (f *Fluent) Stats() interface{} {
+	f.statsMutex.Lock()
+	cpy := f.stats
+	f.statsMutex.Unlock()
 	if f.Config.Async {
-		return &Stats{
-			PendingLogs: uint32(len(f.pending)),
-		}
+		cpy.PendingLogs = uint32(len(f.pending))
+		return &cpy
 	}
-	return &Stats{
-		PendingLogs: uint32(0),
-	}
+	return &cpy
 }
