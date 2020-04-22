@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -58,11 +59,23 @@ type Config struct {
 
 // Stats contains information about Fluent client.
 type Stats struct {
-	PendingLogs uint32 // number of logs waiting to be sent
+	PendingLogs      uint32 // number of logs waiting to be sent
+	Post             uint32
+	WriteHTTPSuccess uint32
+	WriteHTTPFail    uint32
+	Write            uint32
+	QueueIsFull      uint32
+}
+
+func createLogger() *log.Logger {
+	return log.New(os.Stdout, "DEBUG_PRESSURE: ", log.Ldate|log.Ltime|log.Lshortfile|log.Lmicroseconds)
 }
 
 type Fluent struct {
 	Config
+
+	debug *log.Logger
+	stats Stats
 
 	pending chan []byte
 	wg      sync.WaitGroup
@@ -115,11 +128,12 @@ func New(config Config) (f *Fluent, err error) {
 		f = &Fluent{
 			Config:  config,
 			pending: make(chan []byte, config.BufferLimit),
+			debug:   createLogger(),
 		}
 		f.wg.Add(1)
 		go f.run()
 	} else {
-		f = &Fluent{Config: config}
+		f = &Fluent{Config: config, debug: createLogger()}
 		err = f.connect()
 	}
 	return
@@ -185,8 +199,10 @@ func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) err
 	}
 
 	if msgtype.Kind() != reflect.Map {
+		f.debug.Println("fluent#PostWithTime: message must be a map")
 		return errors.New("fluent#PostWithTime: message must be a map")
 	} else if msgtype.Key().Kind() != reflect.String {
+		f.debug.Println("fluent#PostWithTime: map keys must be strings")
 		return errors.New("fluent#PostWithTime: map keys must be strings")
 	}
 
@@ -202,6 +218,7 @@ func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}
 	var data []byte
 	var err error
 	if data, err = f.EncodeData(tag, tm, message); err != nil {
+		f.debug.Printf("fluent#EncodeAndPostData: can't convert '%#v' to msgpack:%v \n", message, err)
 		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%#v' to msgpack:%v", message, err)
 	}
 	return f.postRawData(data)
@@ -213,6 +230,7 @@ func (f *Fluent) PostRawData(data []byte) {
 }
 
 func (f *Fluent) postRawData(data []byte) error {
+	f.stats.Post++
 	if f.Config.Async {
 		return f.appendBuffer(data)
 	}
@@ -265,6 +283,8 @@ func (f *Fluent) appendBuffer(data []byte) error {
 	select {
 	case f.pending <- data:
 	default:
+		f.stats.QueueIsFull++
+		f.debug.Printf("fluent#appendBuffer: Buffer full, limit %v \n", f.Config.BufferLimit)
 		return fmt.Errorf("fluent#appendBuffer: Buffer full, limit %v", f.Config.BufferLimit)
 	}
 	return nil
@@ -307,6 +327,7 @@ func (f *Fluent) run() {
 			}
 			err := f.write(entry)
 			if err != nil {
+				f.debug.Printf("[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
 				fmt.Fprintf(os.Stderr, "[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
 			}
 		}
@@ -323,19 +344,23 @@ func (f *Fluent) write(data []byte) error {
 
 		// Disconnect if connected for too long
 		if time.Duration(0) < f.Config.SocketMaxDuration && time.Now().Sub(f.connExpirationTime) > 0 {
+			f.debug.Println("Connection is too old: let's close it")
 			f.close()
 		}
 
 		// Connect if needed
 		f.muconn.Lock()
 		if f.conn == nil {
+			f.debug.Println("A connection to fluentd is require")
 			err := f.connect()
 			if err != nil {
+				f.debug.Println("Can't reconnect to fluentd. Error: ", err)
 				f.muconn.Unlock()
 				waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
 				if waitTime > f.Config.MaxRetryWait {
 					waitTime = f.Config.MaxRetryWait
 				}
+				f.debug.Printf("Sleep before %d ms before reconnecting", waitTime)
 				time.Sleep(time.Duration(waitTime) * time.Millisecond)
 				continue
 			}
@@ -349,14 +374,20 @@ func (f *Fluent) write(data []byte) error {
 		} else {
 			f.conn.SetWriteDeadline(time.Time{})
 		}
+		f.stats.Write++
 		_, err := f.conn.Write(data)
 		if err != nil {
+			f.stats.WriteHTTPFail++
+			f.debug.Printf("Error will writting to fluentd: %s", err)
+			f.debug.Printf("Closing Fluentd connection due to previous error")
 			f.close()
 		} else {
+			f.stats.WriteHTTPSuccess++
 			return err
 		}
 	}
 
+	f.debug.Printf("fluent#write: failed to reconnect, max retry: %v \n", f.Config.MaxRetry)
 	return fmt.Errorf("fluent#write: failed to reconnect, max retry: %v", f.Config.MaxRetry)
 }
 
